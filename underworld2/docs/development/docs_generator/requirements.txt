@@ -1,0 +1,4 @@
+jupyter
+pandoc
+sphinx_rtd_theme
+mock

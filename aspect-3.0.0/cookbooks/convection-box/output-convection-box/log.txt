@@ -1,0 +1,43 @@
+-----------------------------------------------------------------------------
+--                             This is ASPECT                              --
+-- The Advanced Solver for Planetary Evolution, Convection, and Tectonics. --
+-----------------------------------------------------------------------------
+--     . version 3.0.0
+--     . using deal.II 9.5.1
+--     .       with 32 bit indices
+--     .       with vectorization level 0 (disabled, 1 doubles, 64 bits)
+--     . using Trilinos 13.2.0
+--     . using p4est 2.3.6
+--     . using Geodynamic World Builder 1.0.0
+--     . running in OPTIMIZED mode
+--     . running with 1 MPI process
+-----------------------------------------------------------------------------
+
+-----------------------------------------------------------------------------
+-- For information on how to cite ASPECT, see:
+--   https://aspect.geodynamics.org/citing.html?ver=3.0.0&cbfheatflux=1&mf=1&sha=&src=code
+-----------------------------------------------------------------------------
+Number of active cells: 256 (on 5 levels)
+Number of degrees of freedom: 3,556 (2,178+289+1,089)
+
+*** Timestep 0:  t=0 seconds, dt=0 seconds
+   Solving temperature system... 0 iterations.
+   Solving Stokes system (GMG)... 8+0 iterations.
+
+   Postprocessing:
+     RMS, max velocity:                  1.79 m/s, 2.53 m/s
+     Temperature min/avg/max:            0 K, 0.5 K, 1 K
+     Heat fluxes through boundary parts: 0 W, 0 W, -1 W, 1 W
+     Writing graphical output:           output-convection-box/solution/solution-00000
+
+*** Timestep 1:  t=0.0123369 seconds, dt=0.0123369 seconds
+   Solving temperature system... 31 iterations.
+   Solving Stokes system (GMG)... 8+0 iterations.
+
+   Postprocessing:
+     RMS, max velocity:                  5.93 m/s, 8.38 m/s
+     Temperature min/avg/max:            0 K, 0.5 K, 1 K
+     Heat fluxes through boundary parts: 0 W, 0 W, -1.007 W, 1.007 W
+     Writing graphical output:           output-convection-box/solution/solution-00001
+
+*** Timestep 2:  t=0.0160651 seconds, dt=0.00372818 seconds

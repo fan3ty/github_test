@@ -1,0 +1,23 @@
+# 1: Time step number
+# 2: Time (seconds)
+# 3: Time step size (seconds)
+# 4: Number of mesh cells
+# 5: Number of Stokes degrees of freedom
+# 6: Number of temperature degrees of freedom
+# 7: Iterations for temperature solver
+# 8: Iterations for Stokes solver
+# 9: Velocity iterations in Stokes preconditioner
+# 10: Schur complement iterations in Stokes preconditioner
+# 11: RMS velocity (m/s)
+# 12: Max. velocity (m/s)
+# 13: Minimal temperature (K)
+# 14: Average temperature (K)
+# 15: Maximal temperature (K)
+# 16: Average nondimensional temperature (K)
+# 17: Outward heat flux through boundary with indicator 0 ("left") (W)
+# 18: Outward heat flux through boundary with indicator 1 ("right") (W)
+# 19: Outward heat flux through boundary with indicator 2 ("bottom") (W)
+# 20: Outward heat flux through boundary with indicator 3 ("top") (W)
+# 21: Visualization file name
+0 0.000000000000e+00 0.000000000000e+00 256 2467 1089  0 7 9 9 1.79111133e+00 2.53177078e+00 0.00000000e+00 5.00000000e-01 1.00000000e+00 5.00000000e-01 0.00000000e+00 0.00000000e+00 -1.00000047e+00 1.00000047e+00 output-convection-box/solution/solution-00000 
+1 1.233694160814e-02 1.233694160814e-02 256 2467 1089 31 7 9 9 5.92600061e+00 8.37794884e+00 0.00000000e+00 5.00000000e-01 1.00000000e+00 5.00000000e-01 0.00000000e+00 0.00000000e+00 -1.00687568e+00 1.00687567e+00 output-convection-box/solution/solution-00001 

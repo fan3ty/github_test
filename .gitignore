@@ -1,0 +1,71 @@
+# ASPECT build files
+aspect-3.0.0/build/
+aspect-3.0.0/output/
+aspect-3.0.0/CMakeFiles/
+aspect-3.0.0/cmake_install.cmake
+aspect-3.0.0/CMakeCache.txt
+aspect-3.0.0/Makefile
+aspect-3.0.0/aspect
+aspect-3.0.0/aspect-release
+aspect-3.0.0/tests/output/
+aspect-3.0.0/benchmarks/output/
+
+# Underworld2 build files
+underworld2/build/
+underworld2/dist/
+underworld2/*.egg-info/
+underworld2/__pycache__/
+underworld2/.pytest_cache/
+underworld2/.coverage
+underworld2/htmlcov/
+
+# Python
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.so
+
+# Compiled Object files
+*.o
+*.ko
+*.elf
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Compiled Static libraries
+*.a
+*.lib
+*.la
+*.lo
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Large files
+*.log
+*.dat
+*.vtk
+*.h5
+*.hdf5
+*.nc
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
