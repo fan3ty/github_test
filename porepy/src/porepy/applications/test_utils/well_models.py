@@ -1,0 +1,217 @@
+"""Contains code for setting up a simple but non-trivial model with a well."""
+
+from typing import Literal
+
+import numpy as np
+
+import porepy as pp
+
+
+class OneVerticalWell(pp.PorePyModel):
+    def set_well_network(self) -> None:
+        """Assign well network class."""
+        points = np.array([[0.5, 0.5], [0.5, 0.5], [0.2, 1.0]])
+        mesh_size = self.units.convert_units(1 / 10.0, "m")
+        self.well_network = pp.WellNetwork3d(
+            domain=self.domain,
+            wells=[pp.Well(points)],
+            parameters={"mesh_size": mesh_size},
+        )
+
+    def meshing_arguments(self) -> dict:
+        # Length scale:
+        ls = self.units.convert_units(1, "m")
+        # Set default values, then update with any user-provided meshing arguments.
+        h = 0.15 * ls
+        mesh_sizes = {
+            "cell_size_fracture": h,
+            "cell_size_boundary": h,
+            "cell_size_min": 0.2 * h,
+        }
+        mesh_sizes.update(self.params.get("meshing_args", {}))
+        return mesh_sizes
+
+    def grid_type(self) -> Literal["simplex", "cartesian"]:
+        return self.params.get("grid_type", "simplex")
+
+
+class OneSlantedWell(pp.PorePyModel):
+    """Model with one slanted well.
+
+    If used with a unit cube domain, the well starts at the top at x=0.25 and ends
+    almost at the bottom at x=0.75. The y coordinate is constant at 0.3.
+
+    """
+
+    def set_well_network(self) -> None:
+        """Assign well network class."""
+        points = np.array([[0.25, 0.75], [0.3, 0.3], [1.0, 0.2]])
+        mesh_size = self.units.convert_units(1 / 10.0, "m")
+        self.well_network = pp.WellNetwork3d(
+            domain=self.domain,
+            wells=[pp.Well(points)],
+            parameters={"mesh_size": mesh_size},
+        )
+
+
+class BoundaryConditionsWellSetup(pp.PorePyModel):
+    """Boundary conditions for the well setup."""
+
+    def _bc_type(self, sd: pp.Grid, well_cond: str) -> pp.BoundaryCondition:
+        """Boundary condition type for Darcy flux.
+
+        If `sd` has dimension 1, `well_cond` will be assigned on the top and bottom
+        faces of `sd`. If `sd` has a different dimension, Dirichlet conditions are
+        assigned on the top and bottom faces.
+
+        Parameters:
+            sd: Subdomain for which to define boundary conditions.
+
+        Returns:
+            bc: Boundary condition object.
+
+        """
+        cond = well_cond if sd.dim == 1 else "dir"
+
+        domain_sides = self.domain_boundary_sides(sd)
+        # Define boundary condition on faces
+        return pp.BoundaryCondition(sd, domain_sides.top + domain_sides.bottom, cond)
+
+    def _bc_values(self, bg: pp.BoundaryGrid, value: float) -> np.ndarray:
+        """
+        Parameters:
+            bg: Boundary grid for which to define boundary conditions.
+            value: Value to assign.
+
+        Returns:
+            bc: Boundary condition array.
+
+        """
+
+        vals_loc = np.zeros(bg.num_cells)
+        if bg.dim == 0:
+            domain_sides = self.domain_boundary_sides(bg)
+            # Inflow for the top boundary of the well.
+            vals_loc[domain_sides.top] = value
+        return vals_loc
+
+    def bc_type_darcy_flux(self, sd: pp.Grid) -> pp.BoundaryCondition:
+        """Boundary condition type for Darcy flux.
+
+        Dirichlet boundary conditions are defined on the north and south boundaries.
+
+        Parameters:
+            sd: Subdomain for which to define boundary conditions.
+
+        Returns:
+            bc: Boundary condition object.
+
+        """
+        return self._bc_type(sd, "neu")
+
+    def bc_values_darcy_flux(self, bg: pp.BoundaryGrid) -> np.ndarray:
+        """Boundary condition values for Darcy flux.
+
+        Dirichlet boundary conditions are defined on the north and south boundaries,
+        with a constant value of 0 unless fluid's reference pressure is changed.
+
+        Parameters:
+            bg: Boundary grid for which to define boundary conditions.
+
+        Returns:
+            Boundary condition values array.
+
+        """
+        value = self.units.convert_units(
+            self.params.get("well_flux", -1), "kg * m ^ 3 * s ^ -1"
+        )
+        return self._bc_values(bg, value)
+
+    def bc_type_fluid_flux(self, sd: pp.Grid) -> pp.BoundaryCondition:
+        return self._bc_type(sd, "dir")
+
+    def bc_type_enthalpy_flux(self, sd: pp.Grid) -> pp.BoundaryCondition:
+        """Boundary condition type for enthalpy.
+
+        Dirichlet boundary conditions are defined on the north and south boundaries.
+
+        Parameters:
+            sd: Subdomain for which to define boundary conditions.
+
+        Returns:
+            bc: Boundary condition object.
+
+        """
+        return self._bc_type(sd, "dir")
+
+    def bc_values_temperature(self, bg: pp.BoundaryGrid) -> np.ndarray:
+        """
+        Parameters:
+            bg: A boundary grid in the domain.
+
+        Returns:
+            Numeric enthalpy flux values for a Neumann-type BC.
+
+        """
+        val = self.units.convert_units(self.params.get("well_enthalpy", 1e7), "K")
+        return self._bc_values(bg, val)
+
+    def bc_type_fourier_flux(self, sd: pp.Grid) -> pp.BoundaryCondition:
+        """Boundary condition type for Fourier flux.
+
+        Dirichlet boundary conditions are defined on the north and south boundaries.
+
+        Parameters:
+            sd: Subdomain for which to define boundary conditions.
+
+        Returns:
+            bc: Boundary condition object.
+
+        """
+        return self._bc_type(sd, "neu")
+
+
+class WellPermeability(pp.constitutive_laws.CubicLawPermeability):
+    def permeability(self, subdomains: list[pp.Grid]) -> pp.ad.Operator:
+        """Permeability [m^2].
+
+        This function is an extension of the CubicLawPermeability class which includes
+        well permeability.
+
+        Parameters:
+            subdomains: List of subdomains.
+
+        Returns:
+            Cell-wise permeability values.
+
+        """
+        projection = pp.ad.SubdomainProjections(subdomains, dim=9)
+        matrix = [sd for sd in subdomains if sd.dim == self.nd]
+        fractures_and_intersections: list[pp.Grid] = [
+            sd
+            for sd in subdomains
+            if sd.dim < self.nd and ("parent_well_index" not in sd.tags)
+        ]
+        wells = [sd for sd in subdomains if "parent_well_index" in sd.tags]
+
+        permeability = (
+            projection.cell_prolongation(matrix) @ self.matrix_permeability(matrix)
+            + projection.cell_prolongation(fractures_and_intersections)
+            @ self.cubic_law_permeability(fractures_and_intersections)
+            + projection.cell_prolongation(wells) @ self.well_permeability(wells)
+        )
+        return permeability
+
+    def well_permeability(self, subdomains: list[pp.Grid]) -> pp.ad.Operator:
+        """Permeability [m^2].
+
+        Parameters:
+            subdomains: List of subdomains.
+
+        Returns:
+            Cell-wise permeability values.
+
+        """
+        size = sum(sd.num_cells for sd in subdomains)
+        permeability = pp.wrap_as_dense_ad_array(1, size, name="well permeability")
+        return self.isotropic_second_order_tensor(subdomains, permeability)

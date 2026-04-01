@@ -1,0 +1,25 @@
+name: fastscapelib-docs
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - breathe
+  - cmake
+  - healpix_cxx
+  - xtensor-python>=0.28,<0.29
+  - pybind11
+  - scikit-build-core
+  - numpy
+  - numba
+  - matplotlib-base
+  - pygalmesh
+  - healpy
+  - sphinx
+  - sphinx-remove-toctrees
+  - sphinxcontrib-bibtex
+  - sphinxcontrib-mermaid
+  - sphinx-design
+  - sphinx-autodoc-typehints
+  - myst-nb
+  - furo
+  - pip

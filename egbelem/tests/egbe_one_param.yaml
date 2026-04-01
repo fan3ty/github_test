@@ -1,0 +1,3 @@
+# input file to test use of default parameters
+clock:
+  stop: 300.

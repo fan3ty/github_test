@@ -1,0 +1,280 @@
+"""Contains classes representing two-dimensional fractures.
+
+That is, manifolds of dimension 2 embedded in 3D.
+
+"""
+
+from __future__ import annotations
+
+from typing import Optional, Union
+
+import gmsh
+import numpy as np
+from numpy.typing import ArrayLike
+
+import porepy as pp
+
+from .fracture import PointBasedFracture
+
+
+class PlaneFracture(PointBasedFracture):
+    """A class representing planar fractures in 3D in form of a (bounded) plane,
+    i.e. manifolds of dimension 2 embedded in 3D.
+
+    Non-convex fractures can be initialized, but geometry processing (computation of
+    intersections etc.) is not supported for non-convex geometries.
+
+    For a description of constructor arguments, see base class.
+
+    Raises:
+        AssertionError: If the resulting fracture is not planar or convex
+            (if additional check requested).
+
+    """
+
+    def __init__(
+        self,
+        points: ArrayLike,
+        index: Optional[int] = None,
+        check_convexity: bool = False,
+        sort_points: bool = True,
+    ):
+        super().__init__(points=points, index=index, sort_points=sort_points)
+
+        assert self.is_planar(), "Points define non-planar fracture"
+        if check_convexity:
+            assert self.is_convex(), "Points form non-convex polygon"
+
+    def fracture_to_gmsh(self):
+        """Creates a gmsh representation of the fracture and exports its tag.
+
+        Returns:
+            An integer representing the tag of the fracture.
+
+        """
+        pts = self.pts.T
+        num_pts = pts.shape[0]
+        gmsh_pts = [gmsh.model.occ.addPoint(*pt) for pt in pts]
+        pt_indices = np.concatenate([np.arange(num_pts), [0]])
+        gmsh_lines = [
+            gmsh.model.occ.add_line(
+                gmsh_pts[pt_indices[i]], gmsh_pts[pt_indices[i + 1]]
+            )
+            for i in range(num_pts)
+        ]
+        loop = gmsh.model.occ.add_curve_loop(gmsh_lines)
+        return gmsh.model.occ.add_plane_surface([loop])
+
+    def sort_points(self) -> np.ndarray:
+        """Sort the points in a counter-clockwise (CCW) order.
+
+        Note:
+            For now, the ordering of nodes in based on a simple angle argument. This
+            will not be robust for general point clouds, but we expect the fractures
+            to be regularly shaped in this sense. In particular, we will be safe if
+            the cell is convex.
+
+        Returns:
+            An integer array with containing the sorted indices.
+
+        """
+        # First rotate coordinates to the plane
+        points_2d = self.local_coordinates()
+        # Center around the 2d origin
+        points_2d -= np.mean(points_2d, axis=1).reshape((-1, 1))
+
+        theta = np.arctan2(points_2d[1], points_2d[0])
+        sort_ind = np.argsort(theta)
+
+        self.pts = self.pts[:, sort_ind]
+
+        return sort_ind
+
+    def local_coordinates(self) -> np.ndarray:
+        """Represent the vertex coordinates in the natural 2D plane.
+
+        The plane has constant, but not necessarily zero, third coordinate. I.e.,
+        no translation to the origin is made.
+
+        Returns:
+            An array with ``shape=(2, n)`` representing the 2D coordinates of the
+            vertices.
+
+        """
+        rotation = pp.map_geometry.project_plane_matrix(self.pts)
+        points_2d = rotation.dot(self.pts)
+
+        return points_2d[:2]
+
+    def add_points(
+        self,
+        p: np.ndarray,
+        check_convexity: bool = True,
+        tol: float = 1e-4,
+        enforce_pt_tol: Optional[float] = None,
+    ) -> bool:
+        """Add points to the polygon with the implemented sorting enforced.
+
+        Always run a test to check that the points are still planar. By default,
+        a check of convexity is also performed, however, this can be turned off to
+        speed up simulations (the test uses sympy, which turns out to be slow in many
+        cases).
+
+        Parameters:
+            p: ``shape=(nd, num_pts)``
+
+                Points to be added.
+            check_convexity: ``default=True``
+
+                Verify that the polygon is convex.
+            tol: ``default=1e-4``
+
+                Tolerance used to check if the point already exists.
+            enforce_pt_tol: ``default=None``
+
+                If not ``None``, enforces a maximal distance between points by removing
+                points failing that criterion.
+
+        Returns:
+            ``True``, if the resulting polygon is planar, ``False`` otherwise.
+
+            If the argument ``check_convexity`` is ``True``,
+            checks for planarity **and** convexity.
+
+        """
+        to_enforce = np.hstack(
+            (
+                np.zeros(self.pts.shape[1], dtype=bool),
+                np.ones(p.shape[1], dtype=bool),
+            )
+        )
+        self.pts = np.hstack((self.pts, p))
+        self.pts, _, _ = pp.array_operations.uniquify_point_set(self.pts, tol=tol)
+
+        # Sort points to counter-clockwise
+        mask = self.sort_points()
+
+        if enforce_pt_tol is not None:
+            to_enforce = np.where(to_enforce[mask])[0]
+            dist = pp.distances.pointset(self.pts)
+            dist /= np.amax(dist)
+            np.fill_diagonal(dist, np.inf)
+            mask = np.where(dist < enforce_pt_tol)[0]
+            mask = np.setdiff1d(mask, to_enforce, assume_unique=True)
+            self.remove_points(mask)
+
+        if check_convexity:
+            return self.is_convex() and self.is_planar(tol)
+        else:
+            return self.is_planar()
+
+    def remove_points(
+        self, ind: Union[np.ndarray, list[int]], keep_orig: bool = False
+    ) -> None:
+        """Remove points from the fracture definition.
+
+        Parameters:
+            ind: Array or list of indices of points to be removed.
+            keep_orig: ``default=False``
+
+                If ``True``, keeps the original points in the attribute
+                :attr:`orig_pts`.
+
+        """
+        self.pts = np.delete(self.pts, ind, axis=1)
+
+        if not keep_orig:
+            self.orig_pts = self.pts
+
+    def is_convex(self) -> bool:
+        """See parent class docs."""
+        if self.pts.shape[1] == 3:
+            # A triangle is always convex
+            return True
+
+        p_2d = self.local_coordinates()
+        return self.as_sympy_polygon(p_2d).is_convex()
+
+    def is_planar(self, tol: float = 1e-4) -> bool:
+        """Check if the points representing this fracture lie within a 2D-plane.
+
+        Parameters:
+            tol: ``default=1e-4``
+
+                Tolerance for non-planarity. Treated as an absolute quantity (no
+                scaling with fracture extent).
+
+        Returns:
+            ``True`` if the polygon is planar, ``False`` otherwise.
+
+        """
+        p = self.pts - np.mean(self.pts, axis=1).reshape((-1, 1))
+        rot = pp.map_geometry.project_plane_matrix(p)
+        p_2d = rot.dot(p)
+        return np.max(np.abs(p_2d[2])) < tol
+
+    def compute_centroid(self) -> np.ndarray:
+        """See parent class docs.
+
+        Note:
+            This method assumes the polygon is convex.
+
+        """
+        # Rotate to 2d coordinates
+        rot = pp.map_geometry.project_plane_matrix(self.pts)
+        p = rot.dot(self.pts)
+        z = p[2, 0]
+        p = p[:2]
+
+        # Vectors from the first point to all other points. Subsequent pairs of these
+        # will span triangles which, assuming convexity, will cover the polygon.
+        v = p[:, 1:] - p[:, 0].reshape((-1, 1))
+        # The cell center of the triangles spanned by the subsequent vectors
+        cc = (p[:, 0].reshape((-1, 1)) + p[:, 1:-1] + p[:, 2:]) / 3
+        # Area of triangles
+        area = 0.5 * np.abs(v[0, :-1] * v[1, 1:] - v[1, :-1] * v[0, 1:])
+
+        # The center is found as the area weighted center
+        center = np.sum(cc * area, axis=1) / np.sum(area)
+
+        # Project back again.
+        return rot.transpose().dot(np.append(center, z)).reshape((3, 1))
+
+    def compute_normal(self) -> np.ndarray:
+        return pp.map_geometry.compute_normal(self.pts)[:, None]
+
+    # Removed typing of return type, since this would necessitate an import of the
+    # full sympy module during import of PorePy, which is not desirable.
+    def as_sympy_polygon(self, pts: Optional[np.ndarray] = None):
+        """Represent polygon as a sympy object.
+
+        Parameters:
+            pts: ``shape=(nd, num_pts)``
+
+                Points for the polygon. If ``None``, :attr:`pts` is used.
+
+        Returns:
+            Sympy Representation of the polygon formed by ``pts``.
+
+        """
+        from sympy.geometry import Point, Polygon
+
+        if pts is None:
+            pts = self.pts
+
+        sp = [Point(pts[:, i]) for i in range(pts.shape[1])]
+        return Polygon(*sp)
+
+    def _check_pts(self) -> None:
+        """Check the shape of ``self.pts``.
+
+        Raises:
+            ValueError: If ``self.pts`` does not have the expected shape.
+
+        """
+        if self.pts.shape[0] != 3:
+            raise ValueError(
+                "First dimension of pts defining a PlaneFracture should be 3."
+            )
+        if self.pts.shape[1] < 3:
+            raise ValueError("At least 3 points are needed to define a PlaneFracture.")

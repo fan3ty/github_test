@@ -1,0 +1,46 @@
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+name: CI Additional
+
+jobs:
+  check-links:
+    name: Check links
+    runs-on: "ubuntu-latest"
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@master
+
+    - name: Markdown link check
+      uses: gaurav-nelson/github-action-markdown-link-check@v1
+
+  mypy:
+    name: Mypy
+    runs-on: "ubuntu-latest"
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup micromamba
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: ci/environment-python-dev.yml
+          cache-environment: true
+
+      - name: Install Healpix
+        run: |
+          micromamba install healpix_cxx
+
+      - name: Build and install Fastscapelib Python
+        run: |
+          python -m pip install . -v --no-build-isolation
+
+      - name: Run mypy
+        run: |
+          python -m mypy . --install-types --non-interactive

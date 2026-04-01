@@ -1,0 +1,689 @@
+"""Tests for poromechanics.
+The module contains a setup for a fractured domain, and tests for the poromechanics
+model. The tests are qualitative, in the sense that they check that the solution is
+reasonable (e.g., has the expected sign), but do not check for exact values. Most tests
+are carried out with both the mpsa and tpsa discretizations, though the latter is
+dropped in a few cases where there is no reason to believe that the spatial
+discretization should affect the results.
+
+Overview of tests:
+    - test_poromechanics_model_no_modification: Test that the vanilla poromechanics
+        model runs without errors. Failure of this test would signify rather fundamental
+        problems in the model.
+    - test_without_fracture: Domain with no fractures.
+    - test_2d_single_fracture: Test a domain with a single fracture. The test is
+        parametrized to let the fracture be open or closed, and the test verifies the
+        displacement and pressure fields in the different parts of the domain.
+
+    Then follow tests that to some degree are variations of what is tested
+    test_2d_single_fracture, but together they cover the different boundary conditions
+    (pull/push on north/south side). Their setup and verification are also simpler than
+    test_2d_single_fracture:
+    - test_pull_north_positive_opening: Pull on the north side, open fracture.
+    - test_pull_south_positive_opening: Pull on the south side, open fracture.
+    - test_push_north_zero_opening: Push on the north side, closed fracture.
+    - test_positive_p_frac_positive_opening: Positive fracture pressure implies positive
+        opening.
+    - test_pull_south_positive_reference_pressure: Compare with and without nonzero
+        reference (and initial) solution.
+
+    Finally, there are tests for unit conversion and a well model:
+    - test_unit_conversion: Test that solution is independent of units.
+    - test_poromechanics_well: Test that the poromechanics model runs without errors.
+    - test_poromechanics_empty_equation_filter: Test that empty domain equations
+        in poromechanics models on non-fractured domain exist and are filtered
+        before assembly.
+"""
+
+from __future__ import annotations
+
+import copy
+from typing import Callable
+
+import numpy as np
+import pytest
+
+import porepy as pp
+import porepy.applications.md_grids.model_geometries
+from porepy.applications.test_utils import models, well_models
+
+
+class NonzeroFractureGapPoromechanics(pp.PorePyModel):
+    """Adjust bc values and initial condition."""
+
+    pressure_variable: str
+    displacement_variable: str
+    interface_displacement_variable: str
+    fracture_stress: Callable[[list[pp.MortarGrid]], pp.ad.Operator]
+    fluid_source: Callable[[list[pp.Grid]], pp.ad.Operator]
+
+    def bc_type_darcy_flux(self, sd: pp.Grid) -> pp.BoundaryCondition:
+        domain_sides = self.domain_boundary_sides(sd)
+        return pp.BoundaryCondition(sd, domain_sides.north + domain_sides.south, "dir")
+
+    def ic_values_pressure(self, sd: pp.Grid) -> np.ndarray:
+        # Initial pressure equals reference pressure.
+        return self.reference_variable_values.pressure * np.ones(sd.num_cells)
+
+    def ic_values_displacement(self, sd: pp.Grid) -> np.ndarray:
+        # Set initial displacement compatible with fracture gap for matrix subdomain.
+        if len(self.mdg.subdomains()) > 1:
+            top_cells = sd.cell_centers[1] > self.units.convert_units(0.5, "m")
+            vals = np.zeros((self.nd, sd.num_cells))
+            vals[1, top_cells] = self.solid.fracture_gap
+            return vals.ravel("F")
+        else:
+            # Call super to return expected trivial values, because this class is used
+            # in other test cases as well.
+            return super().ic_values_displacement(sd)
+
+    def ic_values_interface_displacement(self, intf: pp.MortarGrid) -> np.ndarray:
+        # Set initial displacement compatible with fracture gap for matrix-fracture
+        # interface.
+        if len(self.mdg.subdomains()) > 1:
+            sd = self.mdg.subdomains()[0]
+            faces_primary = intf.primary_to_mortar_int().tocsr().indices
+            switcher = pp.grid_utils.switch_sign_if_inwards_normal(
+                sd,
+                self.nd,
+                faces_primary,
+            )
+
+            normals = (switcher * sd.face_normals[: sd.dim].ravel("F")).reshape(
+                sd.dim, -1, order="F"
+            )
+            intf_normals = normals[:, faces_primary]
+            top_cells = intf_normals[1, :] < 0
+
+            # Set mortar displacement to zero on bottom and fracture gap value on top
+            vals = np.zeros((self.nd, intf.num_cells))
+            vals[1, top_cells] = (
+                self.solid.fracture_gap + self.solid.maximum_elastic_fracture_opening
+            )
+            return vals.ravel("F")
+        else:
+            # Call super to return expected trivial values, because this class is used
+            # in other test cases as well.
+            return super().ic_values_interface_displacement(intf)
+
+    def fracture_stress(self, interfaces: list[pp.MortarGrid]) -> pp.ad.Operator:
+        """Fracture stress on interfaces.
+
+        The "else" mimicks old subtract_p_frac=False behavior, which is
+        useful for testing reference pressure.
+
+        Parameters:
+            interfaces: List of interfaces where the stress is defined.
+
+        Returns:
+            Poromechanical stress operator on matrix-fracture interfaces.
+
+        """
+        if not all([intf.dim == self.nd - 1 for intf in interfaces]):
+            raise ValueError("Interfaces must be of dimension nd - 1.")
+
+        if getattr(self, "subtract_p_frac", True):
+            # Contact traction and fracture pressure.
+            return super().fracture_stress(interfaces)
+        else:
+            # Only contact traction.
+            return pp.constitutive_laws.LinearElasticMechanicalStress.fracture_stress(
+                self, interfaces
+            )
+
+    def fluid_source(self, subdomains: list[pp.Grid]) -> pp.ad.Operator:
+        """Fluid source term.
+
+        Add a source term in fractures.
+
+        Parameters:
+            subdomains: List of subdomains where the source term is defined.
+
+        Returns:
+            Fluid source term operator.
+
+        """
+        internal_boundaries = super().fluid_source(subdomains)
+        if "fracture_source_value" not in self.params:
+            return internal_boundaries
+
+        vals = []
+        for sd in subdomains:
+            if sd.dim == self.nd:
+                vals.append(np.zeros(sd.num_cells))
+            else:
+                val = self.units.convert_units(
+                    self.params["fracture_source_value"], "kg * s ^ -1"
+                )
+                # Distribute source term over cells based on cell volumes.
+                vals.append(val * sd.cell_volumes / np.sum(sd.cell_volumes))
+        fracture_source = pp.wrap_as_dense_ad_array(
+            np.hstack(vals), name="fracture_fluid_source"
+        )
+        return internal_boundaries + fracture_source
+
+
+class TailoredPoromechanics(
+    NonzeroFractureGapPoromechanics,
+    pp.model_boundary_conditions.TimeDependentMechanicalBCsDirNorthSouth,
+    pp.model_boundary_conditions.BoundaryConditionsMassDirNorthSouth,
+    models.Poromechanics,
+):
+    """Tailored poromechanics model intended for testing."""
+
+    pass
+
+
+class TailoredPoromechanicsTpsa(
+    pp.poromechanics.TpsaPoromechanicsMixin, TailoredPoromechanics
+):
+    """Tailored poromechanics model with TPSA discretization."""
+
+    pass
+
+
+def create_model_with_fracture(
+    solid_vals: dict,
+    fluid_vals: dict,
+    reference_vals: dict,
+    uy_north: float,
+    model_class: type,
+) -> TailoredPoromechanics:
+    """Create a model for a fractured domain.
+
+    The domain is a unit square with two intersecting fractures.
+
+    Parameters:
+        solid_vals: Parameters for the solid mechanics model.
+        fluid_vals: Parameters for the fluid mechanics model.
+        reference_vals: Reference values for the mechanics model.
+        uy_north: Displacement in y-direction on the north boundary.
+        model: Model class to use.
+
+    Returns:
+        TailoredPoromechanics: A model for a fractured domain.
+
+    """
+    # Instantiate constants and store in params.
+    solid_vals["fracture_gap"] = 0.042
+    solid_vals["residual_aperture"] = 1e-10
+    solid_vals["biot_coefficient"] = 1.0
+    fluid_vals["compressibility"] = 1
+    solid = pp.SolidConstants(**solid_vals)
+    fluid = pp.FluidComponent(**fluid_vals)
+    reference_values = pp.ReferenceVariableValues(**reference_vals)
+
+    model_params = {
+        "times_to_export": [],  # Suppress output for tests
+        "material_constants": {"solid": solid, "fluid": fluid},
+        "reference_variable_values": reference_values,
+        "u_north": [0.0, uy_north],  # Note: List of length nd. Extend if used in 3d.
+        "nl_convergence_inc_atol": 1e-6,
+        "nl_max_iterations": 20,
+    }
+
+    if issubclass(model_class, TailoredPoromechanicsTpsa):
+        # Tpsa is only consistent with Cartesian grids.
+        model_params["cartesian"] = True
+
+    model = model_class(model_params)
+    return model
+
+
+def get_variables(
+    model: TailoredPoromechanics,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Utility function to extract variables from a model.
+
+    Parameters:
+        model: A model for a fractured domain.
+
+    Returns:
+        Tuple containing the following variables:
+            np.ndarray: Displacement values.
+            np.ndarray: Pressure values.
+            np.ndarray: Fracture pressure values.
+            np.ndarray: Displacement jump values.
+            np.ndarray: Contact traction values.
+
+    """
+    matrix_subdomain = model.mdg.subdomains(dim=model.nd)[0]
+    u_var = model.equation_system.get_variables(
+        [model.displacement_variable], [matrix_subdomain]
+    )
+    u_vals = model.equation_system.get_variable_values(
+        variables=u_var, time_step_index=0
+    ).reshape(model.nd, -1, order="F")
+
+    p_var = model.equation_system.get_variables(
+        [model.pressure_variable], model.mdg.subdomains()
+    )
+    p_vals = model.equation_system.get_variable_values(
+        variables=p_var, time_step_index=0
+    )
+    p_var = model.equation_system.get_variables(
+        [model.pressure_variable], model.mdg.subdomains(dim=model.nd - 1)
+    )
+    p_frac = model.equation_system.get_variable_values(
+        variables=p_var, time_step_index=0
+    )
+    # Fracture
+    fracture_subdomains = model.mdg.subdomains(dim=model.nd - 1)
+    jump = model.equation_system.evaluate(
+        model.displacement_jump(fracture_subdomains)
+    ).reshape(model.nd, -1, order="F")
+    traction = model.equation_system.evaluate(
+        model.contact_traction(fracture_subdomains)
+    ).reshape(model.nd, -1, order="F")
+    return u_vals, p_vals, p_frac, jump, traction
+
+
+@pytest.mark.parametrize(
+    "solid_vals,north_displacement",
+    [
+        ({}, 0.0),
+        ({}, -0.1),
+        ({"porosity": 0.5}, 0.1),
+    ],
+)
+@pytest.mark.parametrize(
+    "model_class", [TailoredPoromechanics, TailoredPoromechanicsTpsa]
+)
+def test_2d_single_fracture(
+    solid_vals: dict, north_displacement: float, model_class: type
+):
+    """Test that the solution is qualitatively sound.
+
+    Parameters:
+        solid_vals: Dictionary with keys as those in :class:`pp.SolidConstants`
+            and corresponding values.
+        north_displacement: Value of displacement on the north boundary.
+        model_class: Model class to use.
+
+    """
+
+    model = create_model_with_fracture(
+        solid_vals, {}, {}, north_displacement, model_class
+    )
+    pp.run_time_dependent_model(model)
+    u_vals, p_vals, p_frac, jump, traction = get_variables(model)
+
+    # Create model and run simulation
+    sd = model.mdg.subdomains(dim=model.nd)[0]
+    top = sd.cell_centers[1] > 0.5
+    bottom = sd.cell_centers[1] < 0.5
+    tol = 1e-10
+    if np.isclose(north_displacement, 0.0):
+        assert np.allclose(u_vals[:, bottom], 0)
+        # Zero x and nonzero y displacement in top
+        assert np.allclose(u_vals[0, top], 0)
+        assert np.allclose(u_vals[1, top], model.solid.fracture_gap)
+        # Zero displacement relative to initial value implies zero pressure
+        assert np.allclose(p_vals, 0)
+    elif north_displacement < 0.0:
+        # Boundary displacement is negative, so the y displacement should be
+        # negative
+        assert np.all(u_vals[1] < 0)
+
+        # Check that x displacement is negative for left half and positive for right
+        # half. Tolerance excludes cells at the centerline, where the displacement is
+        # zero.
+        left = sd.cell_centers[0] < model.domain.bounding_box["xmax"] / 2 - tol
+        assert np.all(u_vals[0, left] < 0)
+        right = sd.cell_centers[0] > model.domain.bounding_box["xmax"] / 2 + tol
+        assert np.all(u_vals[0, right] > 0)
+        # Compression implies pressure increase
+        assert np.all(p_vals > 0 - tol)
+    else:
+        # Check that y displacement is positive in top half of domain
+        assert np.all(u_vals[1, top] > 0)
+        # Fracture cuts the domain in half, so the bottom half is only affected by
+        # the pressure, which is negative, and thus the displacement should be
+        # expansive, i.e. positive
+        assert np.all(u_vals[1, bottom] > 0)
+        # Expansion implies pressure reduction
+        assert np.all(p_vals < 0 + tol)
+
+    # Fracture
+    if north_displacement > 0.0:
+        # Normal component of displacement jump should be positive.
+        assert np.all(jump[1] > -tol)
+        # Traction should be zero
+        assert np.allclose(traction, 0)
+    else:
+        # Displacement jump should be equal to initial displacement.
+        assert np.allclose(jump[0], 0.0)
+        assert np.allclose(jump[1], model.solid.fracture_gap)
+        # Normal traction should be non-positive. Zero if north_displacement equals
+        # initial gap, negative otherwise.
+        if north_displacement < 0.0:
+            assert np.all(traction[model.nd - 1 :: model.nd] <= tol)
+        else:
+            assert np.allclose(traction, 0)
+
+
+def test_poromechanics_model_no_modification():
+    """Test that the poromechanics model with no modifications runs with no errors.
+
+    Failure of this test would signify rather fundamental problems in the model.
+    """
+    model = pp.Poromechanics({"times_to_export": []})
+    pp.run_stationary_model(model, {})
+
+
+@pytest.mark.parametrize("biot_coefficient", [0.0, 0.5])
+@pytest.mark.parametrize(
+    "model_class", [TailoredPoromechanics, TailoredPoromechanicsTpsa]
+)
+def test_without_fracture(biot_coefficient, model_class):
+    fluid = pp.FluidComponent(compressibility=0.5)
+    solid = pp.SolidConstants(biot_coefficient=biot_coefficient)
+    params = {
+        "fracture_indices": [],
+        "material_constants": {"fluid": fluid, "solid": solid},
+        "u_north": [0.0, 0.001],
+        "grid_type": "cartesian",
+        "times_to_export": [],
+    }
+    model = model_class(params)
+    pp.run_time_dependent_model(model)
+
+    sd = model.mdg.subdomains(dim=model.nd)
+    u = model.equation_system.evaluate(model.displacement(sd)).reshape(
+        (model.nd, -1), order="F"
+    )
+    p = model.equation_system.evaluate(model.pressure(sd))
+
+    # By symmetry (reasonable to expect from this grid), the average x displacement
+    # should be zero
+    tol = 1e-10
+    assert np.abs(np.sum(u[0])) < tol
+    # Check that y component lies between zero and applied boundary displacement
+    assert np.all(u[1] > 0)
+    assert np.all(u[1] < 0.001)
+    if biot_coefficient == 0:
+        # No coupling implies zero pressure.
+        assert np.allclose(p, 0)
+    else:
+        # Check that the expansion yields a negative pressure.
+        assert np.all(p < -tol)
+
+
+@pytest.mark.parametrize(
+    "model_class", [TailoredPoromechanics, TailoredPoromechanicsTpsa]
+)
+def test_pull_north_positive_opening(model_class: type):
+    """Check solution for a pull on the north side with one horizontal fracture."""
+    model = create_model_with_fracture({}, {}, {}, 0.001, model_class)
+    pp.run_time_dependent_model(model)
+    _, _s, p_frac, jump, traction = get_variables(model)
+
+    # All components should be open in the normal direction
+    assert np.all(jump[1] > 0)
+
+    # By symmetry (reasonable to expect from this grid), the jump in tangential
+    # deformation should be zero.
+    #
+    # EK note to posterity: I believe the lower accuracy is caused by the grid not being
+    # face-orthogonal (see Tpsa paper for definition), which causes the discretization
+    # to be inconsistent.
+    tol = 1e-4 if model_class == TailoredPoromechanicsTpsa else 1e-5
+    assert np.abs(np.sum(jump[0])) < tol
+
+    # The contact force in normal direction should be zero.
+    #
+    # NB: This assumes the contact force is expressed in local coordinates
+    assert np.all(np.abs(traction) < 1e-7)
+
+    # Check that the dilation of the fracture yields a negative fracture pressure
+    assert np.all(p_frac < -1e-7)
+
+
+@pytest.mark.parametrize(
+    "model_class", [TailoredPoromechanics, TailoredPoromechanicsTpsa]
+)
+def test_pull_south_positive_opening(model_class):
+    """Check solution for a pull on the south side with one horizontal fracture."""
+
+    model = create_model_with_fracture({}, {}, {}, 0.0, model_class)
+    model.params["u_south"] = [0.0, -0.001]
+    pp.run_time_dependent_model(model)
+    u_vals, p_vals, p_frac, jump, traction = get_variables(model)
+
+    # All components should be open in the normal direction
+    assert np.all(jump[1] > 0.0)
+
+    # By symmetry (reasonable to expect from this grid), the jump in tangential
+    # deformation should be zero. See comment in test_pull_north_positive_opening()
+    # regarding accuracy obtained with tpsa on this test.
+    tol = 1e-4 if model_class == TailoredPoromechanicsTpsa else 1e-5
+    assert np.abs(np.sum(jump[0])) < tol
+
+    # The contact force in normal direction should be zero
+
+    # NB: This assumes the contact force is expressed in local coordinates
+    assert np.all(np.abs(traction) < 1.0e-7)
+
+    # Check that the dilation of the fracture yields a negative fracture pressure
+    assert np.all(p_frac < -1.0e-7)
+
+
+def test_push_north_zero_opening():
+    model = create_model_with_fracture({}, {}, {}, -0.001, TailoredPoromechanics)
+    pp.run_time_dependent_model(model)
+    u_vals, p_vals, p_frac, jump, traction = get_variables(model)
+
+    # All components should be closed in the normal direction
+    assert np.allclose(jump[1], model.solid.fracture_gap)
+
+    # Contact force in normal direction should be negative
+    assert np.all(traction[1] < 0)
+
+    # Compression of the domain yields a (slightly) positive fracture pressure
+    assert np.all(p_frac > 1e-10)
+
+
+@pytest.mark.parametrize(
+    "model_class", [TailoredPoromechanics, TailoredPoromechanicsTpsa]
+)
+def test_positive_p_frac_positive_opening(model_class):
+    model = create_model_with_fracture({}, {}, {}, 0.0, model_class)
+    model.params["fracture_source_value"] = 0.004
+    pp.run_time_dependent_model(model)
+    _, _, p_frac, jump, traction = get_variables(model)
+
+    # All components should be open in the normal direction
+    assert np.all(jump[1] > model.solid.fracture_gap)
+
+    # By symmetry (reasonable to expect from this grid), the jump in tangential
+    # deformation should be zero. See comment in test_pull_north_positive_opening()
+    # regarding accuracy obtained with tpsa on this test.
+    tol = 1e-4 if model_class == TailoredPoromechanicsTpsa else 1e-5
+    assert np.abs(np.sum(jump[0])) < tol
+
+    # The contact force in normal direction should be zero.
+    # NB: This assumes the contact force is expressed in local coordinates
+    assert np.all(np.abs(traction) < 1e-7)
+
+    # Fracture pressure is positive.
+    mean_pressure = 4.8e-4
+    deviation = 2e-5
+    assert np.allclose(p_frac, mean_pressure, atol=deviation)
+
+
+def test_pull_south_positive_reference_pressure():
+    """Compare with and without nonzero reference (and initial) solution."""
+    reference_model = create_model_with_fracture({}, {}, {}, 0.0, TailoredPoromechanics)
+    reference_model.subtract_p_frac = False
+    reference_model.params["u_south"] = [0.0, -0.001]
+    pp.run_time_dependent_model(reference_model)
+    u_vals_ref, p_vals_ref, p_frac_ref, jump_ref, traction_ref = get_variables(
+        reference_model
+    )
+
+    model = create_model_with_fracture(
+        {}, {}, {"pressure": 1}, 0.0, TailoredPoromechanics
+    )
+    model.subtract_p_frac = False
+    model.params["u_south"] = [0.0, -0.001]
+    pp.run_time_dependent_model(model)
+    u_vals, p_vals, p_frac, jump, traction = get_variables(model)
+
+    assert np.allclose(jump, jump_ref)
+    assert np.allclose(u_vals, u_vals_ref)
+    assert np.allclose(traction, traction_ref)
+    assert np.allclose(p_frac, p_frac_ref + 1)
+    assert np.allclose(p_vals, p_vals_ref + 1)
+
+
+@pytest.mark.parametrize(
+    "units",
+    [
+        {"m": 0.2, "kg": 0.3, "K": 42},
+    ],
+)
+@pytest.mark.parametrize(
+    "model_class", [TailoredPoromechanics, TailoredPoromechanicsTpsa]
+)
+def test_unit_conversion(units, model_class):
+    """Test that solution is independent of units.
+
+    Parameters:
+        units (dict): Dictionary with keys as those in
+            :class:`~pp.compositional.materials.Constants`.
+
+    """
+    solid_vals = pp.solid_values.extended_granite_values_for_testing
+    fluid_vals = pp.fluid_values.extended_water_values_for_testing
+    numerical_vals = pp.numerical_values.extended_numerical_values_for_testing
+    ref_vals = pp.reference_values.extended_reference_values_for_testing
+    solid = pp.SolidConstants(**solid_vals)
+    fluid = pp.FluidComponent(**fluid_vals)
+    numerical = pp.NumericalConstants(**numerical_vals)
+    reference_values = pp.ReferenceVariableValues(**ref_vals)
+    model_params = {
+        "times_to_export": [],  # Suppress output for tests
+        "num_fracs": 1,
+        "grid_type": "cartesian",
+        "u_north": [0.0, 1e-5],
+        "material_constants": {"solid": solid, "fluid": fluid, "numerical": numerical},
+        "reference_variable_values": reference_values,
+    }
+    model_reference_params = copy.deepcopy(model_params)
+    model_reference_params["file_name"] = "unit_conversion_reference"
+
+    # Create model and run simulation
+    reference_model = model_class(model_reference_params)
+    pp.run_time_dependent_model(reference_model)
+
+    model_params["units"] = pp.Units(**units)
+    model = model_class(model_params)
+
+    pp.run_time_dependent_model(model)
+    variables = [
+        model.pressure_variable,
+        model.interface_darcy_flux_variable,
+        model.displacement_variable,
+        model.interface_displacement_variable,
+    ]
+    variable_units = ["Pa", "Pa * m^2 * s^-1", "m", "m"]
+    models.compare_scaled_primary_variables(
+        reference_model, model, variables, variable_units
+    )
+    flux_names = ["darcy_flux", "fluid_flux", "stress", "fracture_stress"]
+    flux_units = ["Pa * m^2 * s^-1", "kg * m^-1 * s^-1", "Pa * m", "Pa"]
+    domain_dimensions = [None, None, 2, 1]
+    models.compare_scaled_model_quantities(
+        reference_model, model, flux_names, flux_units, domain_dimensions
+    )
+
+
+class PoromechanicsWell(
+    well_models.OneVerticalWell,
+    porepy.applications.md_grids.model_geometries.CubeDomainOrthogonalFractures,
+    well_models.BoundaryConditionsWellSetup,
+    pp.Poromechanics,
+):
+    def meshing_arguments(self) -> dict:
+        # Length scale:
+        ls = self.units.convert_units(1, "m")
+        h = 1 * ls
+        mesh_sizes = {
+            "cell_size": h,
+        }
+        return mesh_sizes
+
+
+def test_poromechanics_well():
+    """Test that the poromechanics model runs without errors."""
+    # These parameters hopefully yield a relatively easy problem
+    model_params = {
+        "fracture_indices": [2],
+        "well_flux": -1e-2,
+        "times_to_export": [],
+    }
+    model = PoromechanicsWell(model_params)
+    pp.run_time_dependent_model(model)
+
+
+@pytest.mark.parametrize(
+    "model_class", [TailoredPoromechanics, TailoredPoromechanicsTpsa]
+)
+def test_poromechanics_empty_equation_filter(model_class):
+    """Test that empty domain equations in poromechanics models exist and are
+    filtered before assembly.
+
+    For poromechanics models without fractures, the fracture-related equations
+    can still exist in the equation system. These empty domain equations should
+    be filtered as they do not contribute to the assembly pipline.
+    """
+
+    # Run models without fractures.
+    fluid = pp.FluidComponent(compressibility=0.5)
+    solid = pp.SolidConstants(biot_coefficient=0.5)
+    params = {
+        "fracture_indices": [],
+        "material_constants": {"fluid": fluid, "solid": solid},
+        "u_north": [0.0, 0.001],
+        "grid_type": "cartesian",
+        "times_to_export": [],
+    }
+    model = model_class(params)
+    model.prepare_simulation()
+    equation_system = model.equation_system
+
+    # All equations registered in the equation systems. These include equations
+    # defined on all possible subdomains (matrix, fractures, interfaces),
+    # regardless of whether the corresponding domains are present in the model.
+    all_equations = list(equation_system.equations.keys())
+
+    # Parsed equations after discarding those whose image space is empty.
+    # In poromechanics models without fractures, fracture-related equations are
+    # also registered but have empty image spaces, and are therefore removed here.
+    parsed_equations = list(equation_system._parse_equations().keys())
+
+    # Check empty domain equations exist.
+    empty_equations = []
+    for name in equation_system.equations:
+        total = sum(
+            len(indices)
+            for indices in equation_system.equation_image_space_composition[
+                name
+            ].values()
+        )
+        if total == 0:
+            empty_equations.append(name)
+
+    assert len(empty_equations) > 0
+
+    # Check empty domain equations are filtered.
+    for name in empty_equations:
+        assert name not in parsed_equations
+
+    # Check that the assembled system does not include empty domain equations.
+    A_all, b_all = equation_system.assemble(all_equations)
+    A_filtered, b_filtered = equation_system.assemble(parsed_equations)
+
+    assert A_all.shape == A_filtered.shape
+    assert np.allclose(b_all, b_filtered)
+    assert pp.test_utils.arrays.compare_matrices(A_all, A_filtered)

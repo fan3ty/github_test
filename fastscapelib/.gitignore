@@ -1,0 +1,111 @@
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# cppimport artefacts
+.rendered.*
+*.cppimporthash
+
+# Build directory
+build/
+
+# cmake modules temp files
+CMakeFiles/
+
+# Test build artefacts
+test/test_xtensor
+test/CMakeCache.txt
+test/Makefile
+test/CMakeFiles/
+test/cmake_install.cmake
+
+# Documentation build artefacts
+doc/CMakeCache.txt
+doc/_xml/
+doc/_build/
+doc/*.tmp
+doc/source/api_python/_api_generated
+doc/source/.auctex-auto
+
+# Jupyter artefacts
+.ipynb_checkpoints/
+
+# Generated files
+*.pc
+
+# emacs
+.projectile
+
+# Python Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python distribution / packaging
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Python tests
+.pytest_cache
+.cache
+
+# Installer logs
+pip-log.txt
+
+# IPython / Jupyter
+.ipynb_checkpoints
+
+# misc
+.DS_Store
+
+# IDE / editors
+.ccls
+.ccls-cache/
+.clangd/
+.vscode/
+compile_commands.json
+.dir-locals.el
